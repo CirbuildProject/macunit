@@ -1,0 +1,828 @@
+`timescale 1ns / 1ps
+// ==========================================
+// Pipelined MAC Engine (Top)
+// ==========================================
+module mac_engine_2 #(
+    parameter DATA_W = 16,
+    parameter ACC_W  = 40
+)(
+    input  logic              clk,
+    input  logic              rst_n,
+
+    // AXI4-Stream Slave Interface (Input)
+    input  logic              s_axis_tvalid,
+    output logic              s_axis_tready,
+    input  logic [DATA_W*2-1:0] s_axis_tdata,  
+    input  logic              s_axis_tuser,  
+
+    // AXI4-Stream Master Interface (Output)
+    output logic              m_axis_tvalid,
+    input  logic              m_axis_tready,
+    output logic [ACC_W-1:0]  m_axis_tdata
+);
+    // ==========================================
+    // Internal Signals bridging MAC and Skid Buffer
+    // ==========================================
+    logic             mac_valid_out;
+    logic             mac_ready_in;
+    logic [ACC_W-1:0] mac_data_out;
+    // ==========================================
+    // 0. Global Pipeline Control (Backpressure)
+    // ==========================================
+    logic pipe_en;
+    
+    assign pipe_en = !mac_valid_out || mac_ready_in;
+    assign s_axis_tready = pipe_en && rst_n;
+
+    // ==========================================
+    // Stage 1: Fetch & Decode Registers
+    // ==========================================
+    logic signed [DATA_W-1:0] stg1_op_a;
+    logic signed [DATA_W-1:0] stg1_op_b;
+    logic                     stg1_acc_flag;
+    logic                     stg1_valid;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            stg1_valid    <= 1'b0;
+            stg1_op_a     <= '0;
+            stg1_op_b     <= '0;
+            stg1_acc_flag <= 1'b0;
+        end else if (pipe_en) begin
+            if (s_axis_tvalid && s_axis_tready) begin
+                stg1_valid    <= 1'b1;
+                // Parameterized slicing for clean linting
+                stg1_op_a     <= $signed(s_axis_tdata[DATA_W-1:0]);
+                stg1_op_b     <= $signed(s_axis_tdata[DATA_W*2-1:DATA_W]);
+                stg1_acc_flag <= s_axis_tuser;
+            end else begin
+                stg1_valid    <= 1'b0; 
+            end
+        end
+    end
+
+// ==============================================================================
+// EXPANDED STAGE 2: 3-Cycle Structural Pipelined Multiplier
+// ==============================================================================
+
+// ------------------------------------------------------------------------------
+// 1. Internal Pipeline Interconnects
+// ------------------------------------------------------------------------------
+// Stage 2A Output Signals (Booth Encoded Partial Products)
+logic [31:0] stg2a_pp [0:7]; // 8 rows of 32-bit sign-extended partial products
+logic [7:0]  stg2a_carry_1x; // Inject at row * 2   (For -A)
+logic [7:0]  stg2a_carry_2x; // Inject at row * 2 + 1 (For -2A)
+logic        stg2a_valid;
+logic        stg2a_acc_flag;
+
+// Stage 2B Output Signals (Carry-Save Sum and Carry Vectors)
+logic [31:0] stg2b_sum;
+logic [31:0] stg2b_carry;
+logic        stg2b_valid;
+logic        stg2b_acc_flag;
+
+// Stage 2C Output Signals (Final Product - Matches your original stg2 interface)
+logic signed [DATA_W*2-1:0] stg2_product; 
+logic stg2_valid;
+logic stg2_acc_flag;
+
+
+// ------------------------------------------------------------------------------
+// STAGE 2A: Radix-4 Booth Partial Product Generation
+// ------------------------------------------------------------------------------
+// Goal: Look at stg1_op_b in groups of 3 bits, and generate 8 partial products
+// based on stg1_op_a. 
+
+// Radix-4 Booth Encoding Function
+// a: The 16-bit signed multiplicand (sign-extended to 32 bits before passing)
+// b_window: The 3-bit sliding window from the multiplier
+function automatic logic [31:0] booth_encode(
+    input logic [31:0] a,
+    input logic [2:0]  b_window
+);
+    logic [31:0] a_inv;
+    a_inv = ~a; // Step 1 of Two's Complement (Bitwise Inversion)
+
+    case (b_window)
+        3'b000, 3'b111: booth_encode = 32'd0;                // 0
+        3'b001, 3'b010: booth_encode = a;                    // +A
+        3'b011:         booth_encode = a << 1;               // +2A
+        3'b100:         booth_encode = (a_inv << 1);         // -2A (Needs +1 carry-in later)
+        3'b101, 3'b110: booth_encode = a_inv;                // -A  (Needs +1 carry-in later)
+        default:        booth_encode = 32'd0;
+    endcase
+endfunction
+function automatic logic booth_carry(input logic [2:0] b_window);
+    // Returns 1 if the operation is negative (-A or -2A), requiring a +1 carry-in
+    return (b_window == 3'b100 || b_window == 3'b101 || b_window == 3'b110);
+endfunction
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        stg2a_valid    <= 1'b0;
+        stg2a_acc_flag <= 1'b0;
+        stg2a_carry_1x <= 8'b0;
+        stg2a_carry_2x <= 8'b0;
+        for (int i=0; i<8; i++) stg2a_pp[i] <= '0;
+    end else if (pipe_en) begin
+        stg2a_valid    <= stg1_valid;
+        stg2a_acc_flag <= stg1_acc_flag;
+        if (stg1_valid) begin
+            
+            stg2a_pp[0] <= 32'(signed'(booth_encode({{16{stg1_op_a[15]}}, stg1_op_a}, {stg1_op_b[1:0], 1'b0})));
+            stg2a_pp[1] <= (32'(signed'(booth_encode({{16{stg1_op_a[15]}}, stg1_op_a}, stg1_op_b[3:1]))) << 2);
+            stg2a_pp[2] <= (32'(signed'(booth_encode({{16{stg1_op_a[15]}}, stg1_op_a}, stg1_op_b[5:3]))) << 4);
+            stg2a_pp[3] <= (32'(signed'(booth_encode({{16{stg1_op_a[15]}}, stg1_op_a}, stg1_op_b[7:5]))) << 6);
+            stg2a_pp[4] <= (32'(signed'(booth_encode({{16{stg1_op_a[15]}}, stg1_op_a}, stg1_op_b[9:7]))) << 8);
+            stg2a_pp[5] <= (32'(signed'(booth_encode({{16{stg1_op_a[15]}}, stg1_op_a}, stg1_op_b[11:9]))) << 10);
+            stg2a_pp[6] <= (32'(signed'(booth_encode({{16{stg1_op_a[15]}}, stg1_op_a}, stg1_op_b[13:11]))) << 12);
+            stg2a_pp[7] <= (32'(signed'(booth_encode({{16{stg1_op_a[15]}}, stg1_op_a}, stg1_op_b[15:13]))) << 14);
+
+           // Generate Exact Carry-ins for Two's Complement conversions
+            // 1x Carry (-A) = Windows 101, 110
+            stg2a_carry_1x[0] <= ({stg1_op_b[1:0], 1'b0} == 3'b101 || {stg1_op_b[1:0], 1'b0} == 3'b110);
+            stg2a_carry_1x[1] <= (stg1_op_b[3:1] == 3'b101 || stg1_op_b[3:1] == 3'b110);
+            stg2a_carry_1x[2] <= (stg1_op_b[5:3] == 3'b101 || stg1_op_b[5:3] == 3'b110);
+            stg2a_carry_1x[3] <= (stg1_op_b[7:5] == 3'b101 || stg1_op_b[7:5] == 3'b110);
+            stg2a_carry_1x[4] <= (stg1_op_b[9:7] == 3'b101 || stg1_op_b[9:7] == 3'b110);
+            stg2a_carry_1x[5] <= (stg1_op_b[11:9] == 3'b101 || stg1_op_b[11:9] == 3'b110);
+            stg2a_carry_1x[6] <= (stg1_op_b[13:11] == 3'b101 || stg1_op_b[13:11] == 3'b110);
+            stg2a_carry_1x[7] <= (stg1_op_b[15:13] == 3'b101 || stg1_op_b[15:13] == 3'b110);
+
+            // 2x Carry (-2A) = Window 100
+            stg2a_carry_2x[0] <= ({stg1_op_b[1:0], 1'b0} == 3'b100);
+            stg2a_carry_2x[1] <= (stg1_op_b[3:1] == 3'b100);
+            stg2a_carry_2x[2] <= (stg1_op_b[5:3] == 3'b100);
+            stg2a_carry_2x[3] <= (stg1_op_b[7:5] == 3'b100);
+            stg2a_carry_2x[4] <= (stg1_op_b[9:7] == 3'b100);
+            stg2a_carry_2x[5] <= (stg1_op_b[11:9] == 3'b100);
+            stg2a_carry_2x[6] <= (stg1_op_b[13:11] == 3'b100);
+            stg2a_carry_2x[7] <= (stg1_op_b[15:13] == 3'b100);
+        end
+    end
+end
+
+
+// ------------------------------------------------------------------------------
+// STAGE 2B: Wallace/Dadda Tree Compression
+// ------------------------------------------------------------------------------
+// Goal: Compress 8 rows of partial products down to 2 rows (Sum and Carry)
+// using purely parallel 3:2 compressors (Full Adders). NO horizontal carry chains.
+
+logic [31:0] next_sum, next_carry;
+/* verilator lint_off UNUSEDSIGNAL */
+
+// --- LEVEL 1 COMPRESSION (Target Height: 6) ---
+logic s_L1_c0_0, c_L1_c1_0;
+assign {c_L1_c1_0, s_L1_c0_0} = stg2a_pp[0][0] + stg2a_pp[1][0] + stg2a_pp[2][0];
+logic s_L1_c0_ha0, c_L1_c1_ha0;
+assign {c_L1_c1_ha0, s_L1_c0_ha0} = stg2a_pp[3][0] + stg2a_pp[4][0];
+logic s_L1_c1_1, c_L1_c2_1;
+assign {c_L1_c2_1, s_L1_c1_1} = stg2a_pp[0][1] + stg2a_pp[1][1] + stg2a_pp[2][1];
+logic s_L1_c1_2, c_L1_c2_2;
+assign {c_L1_c2_2, s_L1_c1_2} = stg2a_pp[3][1] + stg2a_pp[4][1] + stg2a_pp[5][1];
+logic s_L1_c1_ha1, c_L1_c2_ha1;
+assign {c_L1_c2_ha1, s_L1_c1_ha1} = stg2a_pp[6][1] + stg2a_pp[7][1];
+logic s_L1_c2_3, c_L1_c3_3;
+assign {c_L1_c3_3, s_L1_c2_3} = stg2a_pp[0][2] + stg2a_pp[1][2] + stg2a_pp[2][2];
+logic s_L1_c2_4, c_L1_c3_4;
+assign {c_L1_c3_4, s_L1_c2_4} = stg2a_pp[3][2] + stg2a_pp[4][2] + stg2a_pp[5][2];
+logic s_L1_c2_5, c_L1_c3_5;
+assign {c_L1_c3_5, s_L1_c2_5} = stg2a_pp[6][2] + stg2a_pp[7][2] + stg2a_carry_1x[1];
+logic s_L1_c3_6, c_L1_c4_6;
+assign {c_L1_c4_6, s_L1_c3_6} = stg2a_pp[0][3] + stg2a_pp[1][3] + stg2a_pp[2][3];
+logic s_L1_c3_7, c_L1_c4_7;
+assign {c_L1_c4_7, s_L1_c3_7} = stg2a_pp[3][3] + stg2a_pp[4][3] + stg2a_pp[5][3];
+logic s_L1_c3_8, c_L1_c4_8;
+assign {c_L1_c4_8, s_L1_c3_8} = stg2a_pp[6][3] + stg2a_pp[7][3] + stg2a_carry_2x[1];
+logic s_L1_c4_9, c_L1_c5_9;
+assign {c_L1_c5_9, s_L1_c4_9} = stg2a_pp[0][4] + stg2a_pp[1][4] + stg2a_pp[2][4];
+logic s_L1_c4_10, c_L1_c5_10;
+assign {c_L1_c5_10, s_L1_c4_10} = stg2a_pp[3][4] + stg2a_pp[4][4] + stg2a_pp[5][4];
+logic s_L1_c4_11, c_L1_c5_11;
+assign {c_L1_c5_11, s_L1_c4_11} = stg2a_pp[6][4] + stg2a_pp[7][4] + stg2a_carry_1x[2];
+logic s_L1_c5_12, c_L1_c6_12;
+assign {c_L1_c6_12, s_L1_c5_12} = stg2a_pp[0][5] + stg2a_pp[1][5] + stg2a_pp[2][5];
+logic s_L1_c5_13, c_L1_c6_13;
+assign {c_L1_c6_13, s_L1_c5_13} = stg2a_pp[3][5] + stg2a_pp[4][5] + stg2a_pp[5][5];
+logic s_L1_c5_14, c_L1_c6_14;
+assign {c_L1_c6_14, s_L1_c5_14} = stg2a_pp[6][5] + stg2a_pp[7][5] + stg2a_carry_2x[2];
+logic s_L1_c6_15, c_L1_c7_15;
+assign {c_L1_c7_15, s_L1_c6_15} = stg2a_pp[0][6] + stg2a_pp[1][6] + stg2a_pp[2][6];
+logic s_L1_c6_16, c_L1_c7_16;
+assign {c_L1_c7_16, s_L1_c6_16} = stg2a_pp[3][6] + stg2a_pp[4][6] + stg2a_pp[5][6];
+logic s_L1_c6_17, c_L1_c7_17;
+assign {c_L1_c7_17, s_L1_c6_17} = stg2a_pp[6][6] + stg2a_pp[7][6] + stg2a_carry_1x[3];
+logic s_L1_c7_18, c_L1_c8_18;
+assign {c_L1_c8_18, s_L1_c7_18} = stg2a_pp[0][7] + stg2a_pp[1][7] + stg2a_pp[2][7];
+logic s_L1_c7_19, c_L1_c8_19;
+assign {c_L1_c8_19, s_L1_c7_19} = stg2a_pp[3][7] + stg2a_pp[4][7] + stg2a_pp[5][7];
+logic s_L1_c7_20, c_L1_c8_20;
+assign {c_L1_c8_20, s_L1_c7_20} = stg2a_pp[6][7] + stg2a_pp[7][7] + stg2a_carry_2x[3];
+logic s_L1_c8_21, c_L1_c9_21;
+assign {c_L1_c9_21, s_L1_c8_21} = stg2a_pp[0][8] + stg2a_pp[1][8] + stg2a_pp[2][8];
+logic s_L1_c8_22, c_L1_c9_22;
+assign {c_L1_c9_22, s_L1_c8_22} = stg2a_pp[3][8] + stg2a_pp[4][8] + stg2a_pp[5][8];
+logic s_L1_c8_23, c_L1_c9_23;
+assign {c_L1_c9_23, s_L1_c8_23} = stg2a_pp[6][8] + stg2a_pp[7][8] + stg2a_carry_1x[4];
+logic s_L1_c9_24, c_L1_c10_24;
+assign {c_L1_c10_24, s_L1_c9_24} = stg2a_pp[0][9] + stg2a_pp[1][9] + stg2a_pp[2][9];
+logic s_L1_c9_25, c_L1_c10_25;
+assign {c_L1_c10_25, s_L1_c9_25} = stg2a_pp[3][9] + stg2a_pp[4][9] + stg2a_pp[5][9];
+logic s_L1_c9_26, c_L1_c10_26;
+assign {c_L1_c10_26, s_L1_c9_26} = stg2a_pp[6][9] + stg2a_pp[7][9] + stg2a_carry_2x[4];
+logic s_L1_c10_27, c_L1_c11_27;
+assign {c_L1_c11_27, s_L1_c10_27} = stg2a_pp[0][10] + stg2a_pp[1][10] + stg2a_pp[2][10];
+logic s_L1_c10_28, c_L1_c11_28;
+assign {c_L1_c11_28, s_L1_c10_28} = stg2a_pp[3][10] + stg2a_pp[4][10] + stg2a_pp[5][10];
+logic s_L1_c10_29, c_L1_c11_29;
+assign {c_L1_c11_29, s_L1_c10_29} = stg2a_pp[6][10] + stg2a_pp[7][10] + stg2a_carry_1x[5];
+logic s_L1_c11_30, c_L1_c12_30;
+assign {c_L1_c12_30, s_L1_c11_30} = stg2a_pp[0][11] + stg2a_pp[1][11] + stg2a_pp[2][11];
+logic s_L1_c11_31, c_L1_c12_31;
+assign {c_L1_c12_31, s_L1_c11_31} = stg2a_pp[3][11] + stg2a_pp[4][11] + stg2a_pp[5][11];
+logic s_L1_c11_32, c_L1_c12_32;
+assign {c_L1_c12_32, s_L1_c11_32} = stg2a_pp[6][11] + stg2a_pp[7][11] + stg2a_carry_2x[5];
+logic s_L1_c12_33, c_L1_c13_33;
+assign {c_L1_c13_33, s_L1_c12_33} = stg2a_pp[0][12] + stg2a_pp[1][12] + stg2a_pp[2][12];
+logic s_L1_c12_34, c_L1_c13_34;
+assign {c_L1_c13_34, s_L1_c12_34} = stg2a_pp[3][12] + stg2a_pp[4][12] + stg2a_pp[5][12];
+logic s_L1_c12_35, c_L1_c13_35;
+assign {c_L1_c13_35, s_L1_c12_35} = stg2a_pp[6][12] + stg2a_pp[7][12] + stg2a_carry_1x[6];
+logic s_L1_c13_36, c_L1_c14_36;
+assign {c_L1_c14_36, s_L1_c13_36} = stg2a_pp[0][13] + stg2a_pp[1][13] + stg2a_pp[2][13];
+logic s_L1_c13_37, c_L1_c14_37;
+assign {c_L1_c14_37, s_L1_c13_37} = stg2a_pp[3][13] + stg2a_pp[4][13] + stg2a_pp[5][13];
+logic s_L1_c13_38, c_L1_c14_38;
+assign {c_L1_c14_38, s_L1_c13_38} = stg2a_pp[6][13] + stg2a_pp[7][13] + stg2a_carry_2x[6];
+logic s_L1_c14_39, c_L1_c15_39;
+assign {c_L1_c15_39, s_L1_c14_39} = stg2a_pp[0][14] + stg2a_pp[1][14] + stg2a_pp[2][14];
+logic s_L1_c14_40, c_L1_c15_40;
+assign {c_L1_c15_40, s_L1_c14_40} = stg2a_pp[3][14] + stg2a_pp[4][14] + stg2a_pp[5][14];
+logic s_L1_c14_41, c_L1_c15_41;
+assign {c_L1_c15_41, s_L1_c14_41} = stg2a_pp[6][14] + stg2a_pp[7][14] + stg2a_carry_1x[7];
+logic s_L1_c15_42, c_L1_c16_42;
+assign {c_L1_c16_42, s_L1_c15_42} = stg2a_pp[0][15] + stg2a_pp[1][15] + stg2a_pp[2][15];
+logic s_L1_c15_43, c_L1_c16_43;
+assign {c_L1_c16_43, s_L1_c15_43} = stg2a_pp[3][15] + stg2a_pp[4][15] + stg2a_pp[5][15];
+logic s_L1_c15_44, c_L1_c16_44;
+assign {c_L1_c16_44, s_L1_c15_44} = stg2a_pp[6][15] + stg2a_pp[7][15] + stg2a_carry_2x[7];
+logic s_L1_c16_45, c_L1_c17_45;
+assign {c_L1_c17_45, s_L1_c16_45} = stg2a_pp[0][16] + stg2a_pp[1][16] + stg2a_pp[2][16];
+logic s_L1_c16_46, c_L1_c17_46;
+assign {c_L1_c17_46, s_L1_c16_46} = stg2a_pp[3][16] + stg2a_pp[4][16] + stg2a_pp[5][16];
+logic s_L1_c16_ha2, c_L1_c17_ha2;
+assign {c_L1_c17_ha2, s_L1_c16_ha2} = stg2a_pp[6][16] + stg2a_pp[7][16];
+logic s_L1_c17_47, c_L1_c18_47;
+assign {c_L1_c18_47, s_L1_c17_47} = stg2a_pp[0][17] + stg2a_pp[1][17] + stg2a_pp[2][17];
+logic s_L1_c17_48, c_L1_c18_48;
+assign {c_L1_c18_48, s_L1_c17_48} = stg2a_pp[3][17] + stg2a_pp[4][17] + stg2a_pp[5][17];
+logic s_L1_c17_ha3, c_L1_c18_ha3;
+assign {c_L1_c18_ha3, s_L1_c17_ha3} = stg2a_pp[6][17] + stg2a_pp[7][17];
+logic s_L1_c18_49, c_L1_c19_49;
+assign {c_L1_c19_49, s_L1_c18_49} = stg2a_pp[0][18] + stg2a_pp[1][18] + stg2a_pp[2][18];
+logic s_L1_c18_50, c_L1_c19_50;
+assign {c_L1_c19_50, s_L1_c18_50} = stg2a_pp[3][18] + stg2a_pp[4][18] + stg2a_pp[5][18];
+logic s_L1_c18_ha4, c_L1_c19_ha4;
+assign {c_L1_c19_ha4, s_L1_c18_ha4} = stg2a_pp[6][18] + stg2a_pp[7][18];
+logic s_L1_c19_51, c_L1_c20_51;
+assign {c_L1_c20_51, s_L1_c19_51} = stg2a_pp[0][19] + stg2a_pp[1][19] + stg2a_pp[2][19];
+logic s_L1_c19_52, c_L1_c20_52;
+assign {c_L1_c20_52, s_L1_c19_52} = stg2a_pp[3][19] + stg2a_pp[4][19] + stg2a_pp[5][19];
+logic s_L1_c19_ha5, c_L1_c20_ha5;
+assign {c_L1_c20_ha5, s_L1_c19_ha5} = stg2a_pp[6][19] + stg2a_pp[7][19];
+logic s_L1_c20_53, c_L1_c21_53;
+assign {c_L1_c21_53, s_L1_c20_53} = stg2a_pp[0][20] + stg2a_pp[1][20] + stg2a_pp[2][20];
+logic s_L1_c20_54, c_L1_c21_54;
+assign {c_L1_c21_54, s_L1_c20_54} = stg2a_pp[3][20] + stg2a_pp[4][20] + stg2a_pp[5][20];
+logic s_L1_c20_ha6, c_L1_c21_ha6;
+assign {c_L1_c21_ha6, s_L1_c20_ha6} = stg2a_pp[6][20] + stg2a_pp[7][20];
+logic s_L1_c21_55, c_L1_c22_55;
+assign {c_L1_c22_55, s_L1_c21_55} = stg2a_pp[0][21] + stg2a_pp[1][21] + stg2a_pp[2][21];
+logic s_L1_c21_56, c_L1_c22_56;
+assign {c_L1_c22_56, s_L1_c21_56} = stg2a_pp[3][21] + stg2a_pp[4][21] + stg2a_pp[5][21];
+logic s_L1_c21_ha7, c_L1_c22_ha7;
+assign {c_L1_c22_ha7, s_L1_c21_ha7} = stg2a_pp[6][21] + stg2a_pp[7][21];
+logic s_L1_c22_57, c_L1_c23_57;
+assign {c_L1_c23_57, s_L1_c22_57} = stg2a_pp[0][22] + stg2a_pp[1][22] + stg2a_pp[2][22];
+logic s_L1_c22_58, c_L1_c23_58;
+assign {c_L1_c23_58, s_L1_c22_58} = stg2a_pp[3][22] + stg2a_pp[4][22] + stg2a_pp[5][22];
+logic s_L1_c22_ha8, c_L1_c23_ha8;
+assign {c_L1_c23_ha8, s_L1_c22_ha8} = stg2a_pp[6][22] + stg2a_pp[7][22];
+logic s_L1_c23_59, c_L1_c24_59;
+assign {c_L1_c24_59, s_L1_c23_59} = stg2a_pp[0][23] + stg2a_pp[1][23] + stg2a_pp[2][23];
+logic s_L1_c23_60, c_L1_c24_60;
+assign {c_L1_c24_60, s_L1_c23_60} = stg2a_pp[3][23] + stg2a_pp[4][23] + stg2a_pp[5][23];
+logic s_L1_c23_ha9, c_L1_c24_ha9;
+assign {c_L1_c24_ha9, s_L1_c23_ha9} = stg2a_pp[6][23] + stg2a_pp[7][23];
+logic s_L1_c24_61, c_L1_c25_61;
+assign {c_L1_c25_61, s_L1_c24_61} = stg2a_pp[0][24] + stg2a_pp[1][24] + stg2a_pp[2][24];
+logic s_L1_c24_62, c_L1_c25_62;
+assign {c_L1_c25_62, s_L1_c24_62} = stg2a_pp[3][24] + stg2a_pp[4][24] + stg2a_pp[5][24];
+logic s_L1_c24_ha10, c_L1_c25_ha10;
+assign {c_L1_c25_ha10, s_L1_c24_ha10} = stg2a_pp[6][24] + stg2a_pp[7][24];
+logic s_L1_c25_63, c_L1_c26_63;
+assign {c_L1_c26_63, s_L1_c25_63} = stg2a_pp[0][25] + stg2a_pp[1][25] + stg2a_pp[2][25];
+logic s_L1_c25_64, c_L1_c26_64;
+assign {c_L1_c26_64, s_L1_c25_64} = stg2a_pp[3][25] + stg2a_pp[4][25] + stg2a_pp[5][25];
+logic s_L1_c25_ha11, c_L1_c26_ha11;
+assign {c_L1_c26_ha11, s_L1_c25_ha11} = stg2a_pp[6][25] + stg2a_pp[7][25];
+logic s_L1_c26_65, c_L1_c27_65;
+assign {c_L1_c27_65, s_L1_c26_65} = stg2a_pp[0][26] + stg2a_pp[1][26] + stg2a_pp[2][26];
+logic s_L1_c26_66, c_L1_c27_66;
+assign {c_L1_c27_66, s_L1_c26_66} = stg2a_pp[3][26] + stg2a_pp[4][26] + stg2a_pp[5][26];
+logic s_L1_c26_ha12, c_L1_c27_ha12;
+assign {c_L1_c27_ha12, s_L1_c26_ha12} = stg2a_pp[6][26] + stg2a_pp[7][26];
+logic s_L1_c27_67, c_L1_c28_67;
+assign {c_L1_c28_67, s_L1_c27_67} = stg2a_pp[0][27] + stg2a_pp[1][27] + stg2a_pp[2][27];
+logic s_L1_c27_68, c_L1_c28_68;
+assign {c_L1_c28_68, s_L1_c27_68} = stg2a_pp[3][27] + stg2a_pp[4][27] + stg2a_pp[5][27];
+logic s_L1_c27_ha13, c_L1_c28_ha13;
+assign {c_L1_c28_ha13, s_L1_c27_ha13} = stg2a_pp[6][27] + stg2a_pp[7][27];
+logic s_L1_c28_69, c_L1_c29_69;
+assign {c_L1_c29_69, s_L1_c28_69} = stg2a_pp[0][28] + stg2a_pp[1][28] + stg2a_pp[2][28];
+logic s_L1_c28_70, c_L1_c29_70;
+assign {c_L1_c29_70, s_L1_c28_70} = stg2a_pp[3][28] + stg2a_pp[4][28] + stg2a_pp[5][28];
+logic s_L1_c28_ha14, c_L1_c29_ha14;
+assign {c_L1_c29_ha14, s_L1_c28_ha14} = stg2a_pp[6][28] + stg2a_pp[7][28];
+logic s_L1_c29_71, c_L1_c30_71;
+assign {c_L1_c30_71, s_L1_c29_71} = stg2a_pp[0][29] + stg2a_pp[1][29] + stg2a_pp[2][29];
+logic s_L1_c29_72, c_L1_c30_72;
+assign {c_L1_c30_72, s_L1_c29_72} = stg2a_pp[3][29] + stg2a_pp[4][29] + stg2a_pp[5][29];
+logic s_L1_c29_ha15, c_L1_c30_ha15;
+assign {c_L1_c30_ha15, s_L1_c29_ha15} = stg2a_pp[6][29] + stg2a_pp[7][29];
+logic s_L1_c30_73, c_L1_c31_73;
+assign {c_L1_c31_73, s_L1_c30_73} = stg2a_pp[0][30] + stg2a_pp[1][30] + stg2a_pp[2][30];
+logic s_L1_c30_74, c_L1_c31_74;
+assign {c_L1_c31_74, s_L1_c30_74} = stg2a_pp[3][30] + stg2a_pp[4][30] + stg2a_pp[5][30];
+logic s_L1_c30_ha16, c_L1_c31_ha16;
+assign {c_L1_c31_ha16, s_L1_c30_ha16} = stg2a_pp[6][30] + stg2a_pp[7][30];
+logic s_L1_c31_75, c_L1_c32_75;
+assign {c_L1_c32_75, s_L1_c31_75} = stg2a_pp[0][31] + stg2a_pp[1][31] + stg2a_pp[2][31];
+logic s_L1_c31_76, c_L1_c32_76;
+assign {c_L1_c32_76, s_L1_c31_76} = stg2a_pp[3][31] + stg2a_pp[4][31] + stg2a_pp[5][31];
+logic s_L1_c31_ha17, c_L1_c32_ha17;
+assign {c_L1_c32_ha17, s_L1_c31_ha17} = stg2a_pp[6][31] + stg2a_pp[7][31];
+
+// --- LEVEL 2 COMPRESSION (Target Height: 4) ---
+logic s_L2_c0_77, c_L2_c1_77;
+assign {c_L2_c1_77, s_L2_c0_77} = s_L1_c0_0 + s_L1_c0_ha0 + stg2a_pp[5][0];
+logic s_L2_c1_78, c_L2_c2_78;
+assign {c_L2_c2_78, s_L2_c1_78} = c_L1_c1_0 + c_L1_c1_ha0 + s_L1_c1_1;
+logic s_L2_c1_ha18, c_L2_c2_ha18;
+assign {c_L2_c2_ha18, s_L2_c1_ha18} = s_L1_c1_2 + s_L1_c1_ha1;
+logic s_L2_c2_79, c_L2_c3_79;
+assign {c_L2_c3_79, s_L2_c2_79} = c_L1_c2_1 + c_L1_c2_2 + c_L1_c2_ha1;
+logic s_L2_c2_80, c_L2_c3_80;
+assign {c_L2_c3_80, s_L2_c2_80} = s_L1_c2_3 + s_L1_c2_4 + s_L1_c2_5;
+logic s_L2_c3_81, c_L2_c4_81;
+assign {c_L2_c4_81, s_L2_c3_81} = c_L1_c3_3 + c_L1_c3_4 + c_L1_c3_5;
+logic s_L2_c3_82, c_L2_c4_82;
+assign {c_L2_c4_82, s_L2_c3_82} = s_L1_c3_6 + s_L1_c3_7 + s_L1_c3_8;
+logic s_L2_c4_83, c_L2_c5_83;
+assign {c_L2_c5_83, s_L2_c4_83} = c_L1_c4_6 + c_L1_c4_7 + c_L1_c4_8;
+logic s_L2_c4_84, c_L2_c5_84;
+assign {c_L2_c5_84, s_L2_c4_84} = s_L1_c4_9 + s_L1_c4_10 + s_L1_c4_11;
+logic s_L2_c5_85, c_L2_c6_85;
+assign {c_L2_c6_85, s_L2_c5_85} = c_L1_c5_9 + c_L1_c5_10 + c_L1_c5_11;
+logic s_L2_c5_86, c_L2_c6_86;
+assign {c_L2_c6_86, s_L2_c5_86} = s_L1_c5_12 + s_L1_c5_13 + s_L1_c5_14;
+logic s_L2_c6_87, c_L2_c7_87;
+assign {c_L2_c7_87, s_L2_c6_87} = c_L1_c6_12 + c_L1_c6_13 + c_L1_c6_14;
+logic s_L2_c6_88, c_L2_c7_88;
+assign {c_L2_c7_88, s_L2_c6_88} = s_L1_c6_15 + s_L1_c6_16 + s_L1_c6_17;
+logic s_L2_c7_89, c_L2_c8_89;
+assign {c_L2_c8_89, s_L2_c7_89} = c_L1_c7_15 + c_L1_c7_16 + c_L1_c7_17;
+logic s_L2_c7_90, c_L2_c8_90;
+assign {c_L2_c8_90, s_L2_c7_90} = s_L1_c7_18 + s_L1_c7_19 + s_L1_c7_20;
+logic s_L2_c8_91, c_L2_c9_91;
+assign {c_L2_c9_91, s_L2_c8_91} = c_L1_c8_18 + c_L1_c8_19 + c_L1_c8_20;
+logic s_L2_c8_92, c_L2_c9_92;
+assign {c_L2_c9_92, s_L2_c8_92} = s_L1_c8_21 + s_L1_c8_22 + s_L1_c8_23;
+logic s_L2_c9_93, c_L2_c10_93;
+assign {c_L2_c10_93, s_L2_c9_93} = c_L1_c9_21 + c_L1_c9_22 + c_L1_c9_23;
+logic s_L2_c9_94, c_L2_c10_94;
+assign {c_L2_c10_94, s_L2_c9_94} = s_L1_c9_24 + s_L1_c9_25 + s_L1_c9_26;
+logic s_L2_c10_95, c_L2_c11_95;
+assign {c_L2_c11_95, s_L2_c10_95} = c_L1_c10_24 + c_L1_c10_25 + c_L1_c10_26;
+logic s_L2_c10_96, c_L2_c11_96;
+assign {c_L2_c11_96, s_L2_c10_96} = s_L1_c10_27 + s_L1_c10_28 + s_L1_c10_29;
+logic s_L2_c11_97, c_L2_c12_97;
+assign {c_L2_c12_97, s_L2_c11_97} = c_L1_c11_27 + c_L1_c11_28 + c_L1_c11_29;
+logic s_L2_c11_98, c_L2_c12_98;
+assign {c_L2_c12_98, s_L2_c11_98} = s_L1_c11_30 + s_L1_c11_31 + s_L1_c11_32;
+logic s_L2_c12_99, c_L2_c13_99;
+assign {c_L2_c13_99, s_L2_c12_99} = c_L1_c12_30 + c_L1_c12_31 + c_L1_c12_32;
+logic s_L2_c12_100, c_L2_c13_100;
+assign {c_L2_c13_100, s_L2_c12_100} = s_L1_c12_33 + s_L1_c12_34 + s_L1_c12_35;
+logic s_L2_c13_101, c_L2_c14_101;
+assign {c_L2_c14_101, s_L2_c13_101} = c_L1_c13_33 + c_L1_c13_34 + c_L1_c13_35;
+logic s_L2_c13_102, c_L2_c14_102;
+assign {c_L2_c14_102, s_L2_c13_102} = s_L1_c13_36 + s_L1_c13_37 + s_L1_c13_38;
+logic s_L2_c14_103, c_L2_c15_103;
+assign {c_L2_c15_103, s_L2_c14_103} = c_L1_c14_36 + c_L1_c14_37 + c_L1_c14_38;
+logic s_L2_c14_104, c_L2_c15_104;
+assign {c_L2_c15_104, s_L2_c14_104} = s_L1_c14_39 + s_L1_c14_40 + s_L1_c14_41;
+logic s_L2_c15_105, c_L2_c16_105;
+assign {c_L2_c16_105, s_L2_c15_105} = c_L1_c15_39 + c_L1_c15_40 + c_L1_c15_41;
+logic s_L2_c15_106, c_L2_c16_106;
+assign {c_L2_c16_106, s_L2_c15_106} = s_L1_c15_42 + s_L1_c15_43 + s_L1_c15_44;
+logic s_L2_c16_107, c_L2_c17_107;
+assign {c_L2_c17_107, s_L2_c16_107} = c_L1_c16_42 + c_L1_c16_43 + c_L1_c16_44;
+logic s_L2_c16_108, c_L2_c17_108;
+assign {c_L2_c17_108, s_L2_c16_108} = s_L1_c16_45 + s_L1_c16_46 + s_L1_c16_ha2;
+logic s_L2_c17_109, c_L2_c18_109;
+assign {c_L2_c18_109, s_L2_c17_109} = c_L1_c17_45 + c_L1_c17_46 + c_L1_c17_ha2;
+logic s_L2_c17_110, c_L2_c18_110;
+assign {c_L2_c18_110, s_L2_c17_110} = s_L1_c17_47 + s_L1_c17_48 + s_L1_c17_ha3;
+logic s_L2_c18_111, c_L2_c19_111;
+assign {c_L2_c19_111, s_L2_c18_111} = c_L1_c18_47 + c_L1_c18_48 + c_L1_c18_ha3;
+logic s_L2_c18_112, c_L2_c19_112;
+assign {c_L2_c19_112, s_L2_c18_112} = s_L1_c18_49 + s_L1_c18_50 + s_L1_c18_ha4;
+logic s_L2_c19_113, c_L2_c20_113;
+assign {c_L2_c20_113, s_L2_c19_113} = c_L1_c19_49 + c_L1_c19_50 + c_L1_c19_ha4;
+logic s_L2_c19_114, c_L2_c20_114;
+assign {c_L2_c20_114, s_L2_c19_114} = s_L1_c19_51 + s_L1_c19_52 + s_L1_c19_ha5;
+logic s_L2_c20_115, c_L2_c21_115;
+assign {c_L2_c21_115, s_L2_c20_115} = c_L1_c20_51 + c_L1_c20_52 + c_L1_c20_ha5;
+logic s_L2_c20_116, c_L2_c21_116;
+assign {c_L2_c21_116, s_L2_c20_116} = s_L1_c20_53 + s_L1_c20_54 + s_L1_c20_ha6;
+logic s_L2_c21_117, c_L2_c22_117;
+assign {c_L2_c22_117, s_L2_c21_117} = c_L1_c21_53 + c_L1_c21_54 + c_L1_c21_ha6;
+logic s_L2_c21_118, c_L2_c22_118;
+assign {c_L2_c22_118, s_L2_c21_118} = s_L1_c21_55 + s_L1_c21_56 + s_L1_c21_ha7;
+logic s_L2_c22_119, c_L2_c23_119;
+assign {c_L2_c23_119, s_L2_c22_119} = c_L1_c22_55 + c_L1_c22_56 + c_L1_c22_ha7;
+logic s_L2_c22_120, c_L2_c23_120;
+assign {c_L2_c23_120, s_L2_c22_120} = s_L1_c22_57 + s_L1_c22_58 + s_L1_c22_ha8;
+logic s_L2_c23_121, c_L2_c24_121;
+assign {c_L2_c24_121, s_L2_c23_121} = c_L1_c23_57 + c_L1_c23_58 + c_L1_c23_ha8;
+logic s_L2_c23_122, c_L2_c24_122;
+assign {c_L2_c24_122, s_L2_c23_122} = s_L1_c23_59 + s_L1_c23_60 + s_L1_c23_ha9;
+logic s_L2_c24_123, c_L2_c25_123;
+assign {c_L2_c25_123, s_L2_c24_123} = c_L1_c24_59 + c_L1_c24_60 + c_L1_c24_ha9;
+logic s_L2_c24_124, c_L2_c25_124;
+assign {c_L2_c25_124, s_L2_c24_124} = s_L1_c24_61 + s_L1_c24_62 + s_L1_c24_ha10;
+logic s_L2_c25_125, c_L2_c26_125;
+assign {c_L2_c26_125, s_L2_c25_125} = c_L1_c25_61 + c_L1_c25_62 + c_L1_c25_ha10;
+logic s_L2_c25_126, c_L2_c26_126;
+assign {c_L2_c26_126, s_L2_c25_126} = s_L1_c25_63 + s_L1_c25_64 + s_L1_c25_ha11;
+logic s_L2_c26_127, c_L2_c27_127;
+assign {c_L2_c27_127, s_L2_c26_127} = c_L1_c26_63 + c_L1_c26_64 + c_L1_c26_ha11;
+logic s_L2_c26_128, c_L2_c27_128;
+assign {c_L2_c27_128, s_L2_c26_128} = s_L1_c26_65 + s_L1_c26_66 + s_L1_c26_ha12;
+logic s_L2_c27_129, c_L2_c28_129;
+assign {c_L2_c28_129, s_L2_c27_129} = c_L1_c27_65 + c_L1_c27_66 + c_L1_c27_ha12;
+logic s_L2_c27_130, c_L2_c28_130;
+assign {c_L2_c28_130, s_L2_c27_130} = s_L1_c27_67 + s_L1_c27_68 + s_L1_c27_ha13;
+logic s_L2_c28_131, c_L2_c29_131;
+assign {c_L2_c29_131, s_L2_c28_131} = c_L1_c28_67 + c_L1_c28_68 + c_L1_c28_ha13;
+logic s_L2_c28_132, c_L2_c29_132;
+assign {c_L2_c29_132, s_L2_c28_132} = s_L1_c28_69 + s_L1_c28_70 + s_L1_c28_ha14;
+logic s_L2_c29_133, c_L2_c30_133;
+assign {c_L2_c30_133, s_L2_c29_133} = c_L1_c29_69 + c_L1_c29_70 + c_L1_c29_ha14;
+logic s_L2_c29_134, c_L2_c30_134;
+assign {c_L2_c30_134, s_L2_c29_134} = s_L1_c29_71 + s_L1_c29_72 + s_L1_c29_ha15;
+logic s_L2_c30_135, c_L2_c31_135;
+assign {c_L2_c31_135, s_L2_c30_135} = c_L1_c30_71 + c_L1_c30_72 + c_L1_c30_ha15;
+logic s_L2_c30_136, c_L2_c31_136;
+assign {c_L2_c31_136, s_L2_c30_136} = s_L1_c30_73 + s_L1_c30_74 + s_L1_c30_ha16;
+logic s_L2_c31_137, c_L2_c32_137;
+assign {c_L2_c32_137, s_L2_c31_137} = c_L1_c31_73 + c_L1_c31_74 + c_L1_c31_ha16;
+logic s_L2_c31_138, c_L2_c32_138;
+assign {c_L2_c32_138, s_L2_c31_138} = s_L1_c31_75 + s_L1_c31_76 + s_L1_c31_ha17;
+
+// --- LEVEL 3 COMPRESSION (Target Height: 3) ---
+logic s_L3_c0_ha19, c_L3_c1_ha19;
+assign {c_L3_c1_ha19, s_L3_c0_ha19} = s_L2_c0_77 + stg2a_pp[6][0];
+logic s_L3_c1_139, c_L3_c2_139;
+assign {c_L3_c2_139, s_L3_c1_139} = c_L2_c1_77 + s_L2_c1_78 + s_L2_c1_ha18;
+logic s_L3_c2_140, c_L3_c3_140;
+assign {c_L3_c3_140, s_L3_c2_140} = c_L2_c2_78 + c_L2_c2_ha18 + s_L2_c2_79;
+logic s_L3_c3_141, c_L3_c4_141;
+assign {c_L3_c4_141, s_L3_c3_141} = c_L2_c3_79 + c_L2_c3_80 + s_L2_c3_81;
+logic s_L3_c4_142, c_L3_c5_142;
+assign {c_L3_c5_142, s_L3_c4_142} = c_L2_c4_81 + c_L2_c4_82 + s_L2_c4_83;
+logic s_L3_c5_143, c_L3_c6_143;
+assign {c_L3_c6_143, s_L3_c5_143} = c_L2_c5_83 + c_L2_c5_84 + s_L2_c5_85;
+logic s_L3_c6_144, c_L3_c7_144;
+assign {c_L3_c7_144, s_L3_c6_144} = c_L2_c6_85 + c_L2_c6_86 + s_L2_c6_87;
+logic s_L3_c7_145, c_L3_c8_145;
+assign {c_L3_c8_145, s_L3_c7_145} = c_L2_c7_87 + c_L2_c7_88 + s_L2_c7_89;
+logic s_L3_c8_146, c_L3_c9_146;
+assign {c_L3_c9_146, s_L3_c8_146} = c_L2_c8_89 + c_L2_c8_90 + s_L2_c8_91;
+logic s_L3_c9_147, c_L3_c10_147;
+assign {c_L3_c10_147, s_L3_c9_147} = c_L2_c9_91 + c_L2_c9_92 + s_L2_c9_93;
+logic s_L3_c10_148, c_L3_c11_148;
+assign {c_L3_c11_148, s_L3_c10_148} = c_L2_c10_93 + c_L2_c10_94 + s_L2_c10_95;
+logic s_L3_c11_149, c_L3_c12_149;
+assign {c_L3_c12_149, s_L3_c11_149} = c_L2_c11_95 + c_L2_c11_96 + s_L2_c11_97;
+logic s_L3_c12_150, c_L3_c13_150;
+assign {c_L3_c13_150, s_L3_c12_150} = c_L2_c12_97 + c_L2_c12_98 + s_L2_c12_99;
+logic s_L3_c13_151, c_L3_c14_151;
+assign {c_L3_c14_151, s_L3_c13_151} = c_L2_c13_99 + c_L2_c13_100 + s_L2_c13_101;
+logic s_L3_c14_152, c_L3_c15_152;
+assign {c_L3_c15_152, s_L3_c14_152} = c_L2_c14_101 + c_L2_c14_102 + s_L2_c14_103;
+logic s_L3_c15_153, c_L3_c16_153;
+assign {c_L3_c16_153, s_L3_c15_153} = c_L2_c15_103 + c_L2_c15_104 + s_L2_c15_105;
+logic s_L3_c16_154, c_L3_c17_154;
+assign {c_L3_c17_154, s_L3_c16_154} = c_L2_c16_105 + c_L2_c16_106 + s_L2_c16_107;
+logic s_L3_c17_155, c_L3_c18_155;
+assign {c_L3_c18_155, s_L3_c17_155} = c_L2_c17_107 + c_L2_c17_108 + s_L2_c17_109;
+logic s_L3_c18_156, c_L3_c19_156;
+assign {c_L3_c19_156, s_L3_c18_156} = c_L2_c18_109 + c_L2_c18_110 + s_L2_c18_111;
+logic s_L3_c19_157, c_L3_c20_157;
+assign {c_L3_c20_157, s_L3_c19_157} = c_L2_c19_111 + c_L2_c19_112 + s_L2_c19_113;
+logic s_L3_c20_158, c_L3_c21_158;
+assign {c_L3_c21_158, s_L3_c20_158} = c_L2_c20_113 + c_L2_c20_114 + s_L2_c20_115;
+logic s_L3_c21_159, c_L3_c22_159;
+assign {c_L3_c22_159, s_L3_c21_159} = c_L2_c21_115 + c_L2_c21_116 + s_L2_c21_117;
+logic s_L3_c22_160, c_L3_c23_160;
+assign {c_L3_c23_160, s_L3_c22_160} = c_L2_c22_117 + c_L2_c22_118 + s_L2_c22_119;
+logic s_L3_c23_161, c_L3_c24_161;
+assign {c_L3_c24_161, s_L3_c23_161} = c_L2_c23_119 + c_L2_c23_120 + s_L2_c23_121;
+logic s_L3_c24_162, c_L3_c25_162;
+assign {c_L3_c25_162, s_L3_c24_162} = c_L2_c24_121 + c_L2_c24_122 + s_L2_c24_123;
+logic s_L3_c25_163, c_L3_c26_163;
+assign {c_L3_c26_163, s_L3_c25_163} = c_L2_c25_123 + c_L2_c25_124 + s_L2_c25_125;
+logic s_L3_c26_164, c_L3_c27_164;
+assign {c_L3_c27_164, s_L3_c26_164} = c_L2_c26_125 + c_L2_c26_126 + s_L2_c26_127;
+logic s_L3_c27_165, c_L3_c28_165;
+assign {c_L3_c28_165, s_L3_c27_165} = c_L2_c27_127 + c_L2_c27_128 + s_L2_c27_129;
+logic s_L3_c28_166, c_L3_c29_166;
+assign {c_L3_c29_166, s_L3_c28_166} = c_L2_c28_129 + c_L2_c28_130 + s_L2_c28_131;
+logic s_L3_c29_167, c_L3_c30_167;
+assign {c_L3_c30_167, s_L3_c29_167} = c_L2_c29_131 + c_L2_c29_132 + s_L2_c29_133;
+logic s_L3_c30_168, c_L3_c31_168;
+assign {c_L3_c31_168, s_L3_c30_168} = c_L2_c30_133 + c_L2_c30_134 + s_L2_c30_135;
+logic s_L3_c31_169, c_L3_c32_169;
+assign {c_L3_c32_169, s_L3_c31_169} = c_L2_c31_135 + c_L2_c31_136 + s_L2_c31_137;
+
+// --- LEVEL 4 COMPRESSION (Target Height: 2) ---
+logic s_L4_c0_ha20, c_L4_c1_ha20;
+assign {c_L4_c1_ha20, s_L4_c0_ha20} = s_L3_c0_ha19 + stg2a_pp[7][0];
+logic s_L4_c1_170, c_L4_c2_170;
+assign {c_L4_c2_170, s_L4_c1_170} = c_L3_c1_ha19 + s_L3_c1_139 + stg2a_carry_2x[0];
+logic s_L4_c2_171, c_L4_c3_171;
+assign {c_L4_c3_171, s_L4_c2_171} = c_L3_c2_139 + s_L3_c2_140 + s_L2_c2_80;
+logic s_L4_c3_172, c_L4_c4_172;
+assign {c_L4_c4_172, s_L4_c3_172} = c_L3_c3_140 + s_L3_c3_141 + s_L2_c3_82;
+logic s_L4_c4_173, c_L4_c5_173;
+assign {c_L4_c5_173, s_L4_c4_173} = c_L3_c4_141 + s_L3_c4_142 + s_L2_c4_84;
+logic s_L4_c5_174, c_L4_c6_174;
+assign {c_L4_c6_174, s_L4_c5_174} = c_L3_c5_142 + s_L3_c5_143 + s_L2_c5_86;
+logic s_L4_c6_175, c_L4_c7_175;
+assign {c_L4_c7_175, s_L4_c6_175} = c_L3_c6_143 + s_L3_c6_144 + s_L2_c6_88;
+logic s_L4_c7_176, c_L4_c8_176;
+assign {c_L4_c8_176, s_L4_c7_176} = c_L3_c7_144 + s_L3_c7_145 + s_L2_c7_90;
+logic s_L4_c8_177, c_L4_c9_177;
+assign {c_L4_c9_177, s_L4_c8_177} = c_L3_c8_145 + s_L3_c8_146 + s_L2_c8_92;
+logic s_L4_c9_178, c_L4_c10_178;
+assign {c_L4_c10_178, s_L4_c9_178} = c_L3_c9_146 + s_L3_c9_147 + s_L2_c9_94;
+logic s_L4_c10_179, c_L4_c11_179;
+assign {c_L4_c11_179, s_L4_c10_179} = c_L3_c10_147 + s_L3_c10_148 + s_L2_c10_96;
+logic s_L4_c11_180, c_L4_c12_180;
+assign {c_L4_c12_180, s_L4_c11_180} = c_L3_c11_148 + s_L3_c11_149 + s_L2_c11_98;
+logic s_L4_c12_181, c_L4_c13_181;
+assign {c_L4_c13_181, s_L4_c12_181} = c_L3_c12_149 + s_L3_c12_150 + s_L2_c12_100;
+logic s_L4_c13_182, c_L4_c14_182;
+assign {c_L4_c14_182, s_L4_c13_182} = c_L3_c13_150 + s_L3_c13_151 + s_L2_c13_102;
+logic s_L4_c14_183, c_L4_c15_183;
+assign {c_L4_c15_183, s_L4_c14_183} = c_L3_c14_151 + s_L3_c14_152 + s_L2_c14_104;
+logic s_L4_c15_184, c_L4_c16_184;
+assign {c_L4_c16_184, s_L4_c15_184} = c_L3_c15_152 + s_L3_c15_153 + s_L2_c15_106;
+logic s_L4_c16_185, c_L4_c17_185;
+assign {c_L4_c17_185, s_L4_c16_185} = c_L3_c16_153 + s_L3_c16_154 + s_L2_c16_108;
+logic s_L4_c17_186, c_L4_c18_186;
+assign {c_L4_c18_186, s_L4_c17_186} = c_L3_c17_154 + s_L3_c17_155 + s_L2_c17_110;
+logic s_L4_c18_187, c_L4_c19_187;
+assign {c_L4_c19_187, s_L4_c18_187} = c_L3_c18_155 + s_L3_c18_156 + s_L2_c18_112;
+logic s_L4_c19_188, c_L4_c20_188;
+assign {c_L4_c20_188, s_L4_c19_188} = c_L3_c19_156 + s_L3_c19_157 + s_L2_c19_114;
+logic s_L4_c20_189, c_L4_c21_189;
+assign {c_L4_c21_189, s_L4_c20_189} = c_L3_c20_157 + s_L3_c20_158 + s_L2_c20_116;
+logic s_L4_c21_190, c_L4_c22_190;
+assign {c_L4_c22_190, s_L4_c21_190} = c_L3_c21_158 + s_L3_c21_159 + s_L2_c21_118;
+logic s_L4_c22_191, c_L4_c23_191;
+assign {c_L4_c23_191, s_L4_c22_191} = c_L3_c22_159 + s_L3_c22_160 + s_L2_c22_120;
+logic s_L4_c23_192, c_L4_c24_192;
+assign {c_L4_c24_192, s_L4_c23_192} = c_L3_c23_160 + s_L3_c23_161 + s_L2_c23_122;
+logic s_L4_c24_193, c_L4_c25_193;
+assign {c_L4_c25_193, s_L4_c24_193} = c_L3_c24_161 + s_L3_c24_162 + s_L2_c24_124;
+logic s_L4_c25_194, c_L4_c26_194;
+assign {c_L4_c26_194, s_L4_c25_194} = c_L3_c25_162 + s_L3_c25_163 + s_L2_c25_126;
+logic s_L4_c26_195, c_L4_c27_195;
+assign {c_L4_c27_195, s_L4_c26_195} = c_L3_c26_163 + s_L3_c26_164 + s_L2_c26_128;
+logic s_L4_c27_196, c_L4_c28_196;
+assign {c_L4_c28_196, s_L4_c27_196} = c_L3_c27_164 + s_L3_c27_165 + s_L2_c27_130;
+logic s_L4_c28_197, c_L4_c29_197;
+assign {c_L4_c29_197, s_L4_c28_197} = c_L3_c28_165 + s_L3_c28_166 + s_L2_c28_132;
+logic s_L4_c29_198, c_L4_c30_198;
+assign {c_L4_c30_198, s_L4_c29_198} = c_L3_c29_166 + s_L3_c29_167 + s_L2_c29_134;
+logic s_L4_c30_199, c_L4_c31_199;
+assign {c_L4_c31_199, s_L4_c30_199} = c_L3_c30_167 + s_L3_c30_168 + s_L2_c30_136;
+logic s_L4_c31_200, c_L4_c32_200;
+assign {c_L4_c32_200, s_L4_c31_200} = c_L3_c31_168 + s_L3_c31_169 + s_L2_c31_138;
+
+// --- FINAL STAGE 2B EGRESS ASSIGNMENTS ---
+assign next_sum[0] = s_L4_c0_ha20;
+assign next_carry[0] = stg2a_carry_1x[0];
+assign next_sum[1] = c_L4_c1_ha20;
+assign next_carry[1] = s_L4_c1_170;
+assign next_sum[2] = c_L4_c2_170;
+assign next_carry[2] = s_L4_c2_171;
+assign next_sum[3] = c_L4_c3_171;
+assign next_carry[3] = s_L4_c3_172;
+assign next_sum[4] = c_L4_c4_172;
+assign next_carry[4] = s_L4_c4_173;
+assign next_sum[5] = c_L4_c5_173;
+assign next_carry[5] = s_L4_c5_174;
+assign next_sum[6] = c_L4_c6_174;
+assign next_carry[6] = s_L4_c6_175;
+assign next_sum[7] = c_L4_c7_175;
+assign next_carry[7] = s_L4_c7_176;
+assign next_sum[8] = c_L4_c8_176;
+assign next_carry[8] = s_L4_c8_177;
+assign next_sum[9] = c_L4_c9_177;
+assign next_carry[9] = s_L4_c9_178;
+assign next_sum[10] = c_L4_c10_178;
+assign next_carry[10] = s_L4_c10_179;
+assign next_sum[11] = c_L4_c11_179;
+assign next_carry[11] = s_L4_c11_180;
+assign next_sum[12] = c_L4_c12_180;
+assign next_carry[12] = s_L4_c12_181;
+assign next_sum[13] = c_L4_c13_181;
+assign next_carry[13] = s_L4_c13_182;
+assign next_sum[14] = c_L4_c14_182;
+assign next_carry[14] = s_L4_c14_183;
+assign next_sum[15] = c_L4_c15_183;
+assign next_carry[15] = s_L4_c15_184;
+assign next_sum[16] = c_L4_c16_184;
+assign next_carry[16] = s_L4_c16_185;
+assign next_sum[17] = c_L4_c17_185;
+assign next_carry[17] = s_L4_c17_186;
+assign next_sum[18] = c_L4_c18_186;
+assign next_carry[18] = s_L4_c18_187;
+assign next_sum[19] = c_L4_c19_187;
+assign next_carry[19] = s_L4_c19_188;
+assign next_sum[20] = c_L4_c20_188;
+assign next_carry[20] = s_L4_c20_189;
+assign next_sum[21] = c_L4_c21_189;
+assign next_carry[21] = s_L4_c21_190;
+assign next_sum[22] = c_L4_c22_190;
+assign next_carry[22] = s_L4_c22_191;
+assign next_sum[23] = c_L4_c23_191;
+assign next_carry[23] = s_L4_c23_192;
+assign next_sum[24] = c_L4_c24_192;
+assign next_carry[24] = s_L4_c24_193;
+assign next_sum[25] = c_L4_c25_193;
+assign next_carry[25] = s_L4_c25_194;
+assign next_sum[26] = c_L4_c26_194;
+assign next_carry[26] = s_L4_c26_195;
+assign next_sum[27] = c_L4_c27_195;
+assign next_carry[27] = s_L4_c27_196;
+assign next_sum[28] = c_L4_c28_196;
+assign next_carry[28] = s_L4_c28_197;
+assign next_sum[29] = c_L4_c29_197;
+assign next_carry[29] = s_L4_c29_198;
+assign next_sum[30] = c_L4_c30_198;
+assign next_carry[30] = s_L4_c30_199;
+assign next_sum[31] = c_L4_c31_199;
+assign next_carry[31] = s_L4_c31_200;
+
+/* verilator lint_on UNUSEDSIGNAL */
+
+
+
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        stg2b_valid    <= 1'b0;
+        stg2b_acc_flag <= 1'b0;
+        stg2b_sum      <= '0;
+        stg2b_carry    <= '0;
+    end else if (pipe_en) begin
+        stg2b_valid    <= stg2a_valid;
+        stg2b_acc_flag <= stg2a_acc_flag;
+        
+        if (stg2a_valid) begin
+            stg2b_sum   <= next_sum;
+            stg2b_carry <= next_carry; // Note: Ensure the carry vector is logically shifted left by 1
+        end
+    end
+end
+
+
+// ------------------------------------------------------------------------------
+// STAGE 2C: Final Carry-Propagate Addition
+// ------------------------------------------------------------------------------
+// Goal: Add the final two vectors together. Because it is only two rows, 
+// the synthesizer can safely infer a high-speed Carry Lookahead Adder (CLA) 
+// without violating the 25 ns target period.
+
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        stg2_valid    <= 1'b0;
+        stg2_acc_flag <= 1'b0;
+        stg2_product  <= '0;
+    end else if (pipe_en) begin
+        stg2_valid    <= stg2b_valid;
+        stg2_acc_flag <= stg2b_acc_flag;
+        
+        if (stg2b_valid) begin
+            // Synthesizer will map this standard '+' to a fast CLA in Sky130
+            stg2_product <= $signed(stg2b_sum) + $signed(stg2b_carry);
+        end
+    end
+end
+
+    // ==========================================
+    // Stage 3: Accumulate & Saturate
+    // ==========================================
+    logic signed [ACC_W-1:0] stg3_acc_reg;
+    logic                    stg3_valid;
+    logic signed [ACC_W-1:0] ext_product;
+    logic signed [ACC_W-1:0] next_acc;
+    logic                    overflow;
+    logic                    underflow;
+
+    // Bulletproof explicit sign extension to prevent C++ coercion bugs
+    assign ext_product = $signed({ {(ACC_W-DATA_W*2){stg2_product[DATA_W*2-1]}}, stg2_product });
+    assign next_acc = stg3_acc_reg + ext_product;
+
+    assign overflow  = (stg3_acc_reg[ACC_W-1] == 1'b0) && (ext_product[ACC_W-1] == 1'b0) && (next_acc[ACC_W-1] == 1'b1);
+    assign underflow = (stg3_acc_reg[ACC_W-1] == 1'b1) && (ext_product[ACC_W-1] == 1'b1) && (next_acc[ACC_W-1] == 1'b0);
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            stg3_valid   <= 1'b0;
+            stg3_acc_reg <= '0;
+        end else if (pipe_en) begin
+            stg3_valid <= stg2_valid;
+            
+            if (stg2_valid) begin
+                if (stg2_acc_flag == 1'b0) begin
+                    stg3_acc_reg <= ext_product;
+                end else begin
+                    if (overflow) begin
+                        stg3_acc_reg <= {1'b0, {(ACC_W-1){1'b1}}}; // Max Positive
+                    end else if (underflow) begin
+                        stg3_acc_reg <= {1'b1, {(ACC_W-1){1'b0}}}; // Max Negative
+                    end else begin
+                        stg3_acc_reg <= next_acc;
+                    end
+                end
+            end
+        end
+    end
+
+    assign mac_valid_out = stg3_valid;
+    assign mac_data_out  = stg3_acc_reg;
+
+    //Instantiate Skid Buffer to decouple backpressure from MAC
+    axi_skid_buffer #(.WIDTH(ACC_W)) u_skid (
+        .clk(clk),
+        .rst_n(rst_n),
+        .s_valid(mac_valid_out),
+        .s_ready(mac_ready_in),   // Skid buffer tells MAC if it can accept data
+        .s_data(mac_data_out),
+        .m_valid(m_axis_tvalid),
+        .m_ready(m_axis_tready),
+        .m_data(m_axis_tdata)
+    );
+
+    // ==========================================
+    // Hardware Assertions (Simulation Only)
+    // ==========================================
+    // synthesis translate_off
+    `ifndef __ICARUS__
+    // 1. AXI Protocol Defense: Master must not change data while stalled
+    property p_axi_data_stable;
+        /* verilator lint_off SYNCASYNCNET */
+        @(posedge clk) disable iff (!rst_n)
+        /* verilator lint_off SYNCASYNCNET */
+        (s_axis_tvalid && !s_axis_tready) |=> ($stable(s_axis_tdata) && $stable(s_axis_tuser) && s_axis_tvalid);
+    endproperty
+    assert_axi_data_stable: assert property (p_axi_data_stable) 
+        else $error("SVA FAULT: Master changed s_axis_tdata or dropped TVALID while stalled!");
+
+    // 2. Datapath Defense: Accumulator must never enter an unknown (X) state
+    property p_no_x_acc;
+        /* verilator lint_off SYNCASYNCNET */
+        @(posedge clk) disable iff (!rst_n)
+        /* verilator lint_off SYNCASYNCNET */
+        !$isunknown(stg3_acc_reg);
+    endproperty
+    assert_no_x_acc: assert property (p_no_x_acc) 
+        else $fatal(1, "SVA FATAL: Accumulator entered X-state. Simulation terminated.");
+
+    // 3. Control Defense: Valid signals cannot be unknown
+    property p_no_x_control;
+        /* verilator lint_off SYNCASYNCNET */
+        @(posedge clk) disable iff (!rst_n)
+        /* verilator lint_off SYNCASYNCNET */
+        !$isunknown({s_axis_tvalid, m_axis_tvalid});
+    endproperty
+    assert_no_x_control: assert property (p_no_x_control) 
+        else $error("SVA FAULT: AXI TVALID signal is X!");
+    `endif
+    // synthesis translate_on
+endmodule
