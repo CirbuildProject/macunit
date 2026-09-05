@@ -1,4 +1,6 @@
-./runs
+runs
 sim.vvp
-./RUN_2026-07-28_11-52-35/
-./mac_verification/obj_dir*
+RUN_2026-07-28_11-52-35/*-*/
+RUN_2026-07-28_11-52-35/tmp/
+RUN_2026-07-28_11-52-35/*-*/
+mac_verification/obj_dir*
